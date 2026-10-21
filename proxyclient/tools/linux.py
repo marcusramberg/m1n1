@@ -162,4 +162,8 @@ print("DAIF: %x" % daif)
 
 p.kboot_boot(boot_addr)
 
-iface.ttymode(tty_dev)
+if getattr(iface.dev, "raw_usb", False):
+    print("Direct m1n1 USB transport complete; watch the device display for Linux output.")
+    iface.dev.close()
+else:
+    iface.ttymode(tty_dev)

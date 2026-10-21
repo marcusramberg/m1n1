@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-import itertools, fnmatch, sys
+import itertools, fnmatch, os, sys
 from construct import *
 import sys
 
@@ -424,6 +424,9 @@ def parse_prop(node, path, node_name, name, v, is_template=False):
         else:
             t = Function
 
+    if name == "identifier" and t is FourCC and len(v) > 4 and len(v) % 4 == 0:
+        t = SafeGreedyRange(FourCC)
+
     if name == "reg" and path != "/device-tree/memory":
         n = node._parent
         while n is not None and n._parent is not None:
@@ -468,7 +471,13 @@ def parse_prop(node, path, node_name, name, v, is_template=False):
         t = Array(len(v) // 4, Int32ul)
 
     if t is not None:
-        v = Sequence(t, Terminated).parse(v)[0]
+        try:
+            v = Sequence(t, Terminated).parse(v)[0]
+        except Exception:
+            if os.environ.get("M1N1_ADT_TOLERANT"):
+                print("Keeping unparsed ADT property:", path, name, v.hex(), file=sys.stderr)
+                return None, v
+            raise
         return t, v
 
     if name in STD_PROPERTIES:
@@ -485,7 +494,10 @@ def parse_prop(node, path, node_name, name, v, is_template=False):
     if t is not None:
         try:
             v = Sequence(t, Terminated).parse(v)[0]
-        except:
+        except Exception:
+            if os.environ.get("M1N1_ADT_TOLERANT"):
+                print("Keeping unparsed ADT property:", path, name, v.hex(), file=sys.stderr)
+                return None, v
             print("Failed to parse:", path, name, v.hex())
             raise
 

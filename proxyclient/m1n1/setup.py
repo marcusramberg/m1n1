@@ -9,8 +9,14 @@ from .tgtypes import *
 from .utils import *
 from .hw.pmu import PMU
 
-# Create serial connection
-iface = UartInterface()
+# Create serial connection. The direct USB mode works around DWC3 revisions
+# which only complete bulk OUT when the programmed 16 KiB TRB is filled.
+if os.environ.get("M1N1_USB_FULL_OUT"):
+    from .usbtransport import UsbCdcTransport
+    os.environ.setdefault("M1N1_ADT_TOLERANT", "1")
+    iface = UartInterface(UsbCdcTransport())
+else:
+    iface = UartInterface()
 # Construct m1n1 proxy layer over serial connection
 p = M1N1Proxy(iface, debug=False)
 # Customise parameters of proxy and serial port

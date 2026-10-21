@@ -10,6 +10,7 @@
 #include "soc.h"
 #include "string.h"
 #include "tps6598x.h"
+#include "tunables.h"
 #include "types.h"
 #include "usb_complex.h"
 #include "usb_dwc2.h"
@@ -37,10 +38,14 @@ struct usb_drd_regs {
 
 // length of the format string is is used as buffer size
 // limits the USB instance numbers to reasonable 2 digits
-#define FMT_DART_PATH        "/arm-io/dart-usb%u"
-#define FMT_DART_MAPPER_PATH "/arm-io/dart-usb%u/mapper-usb%u"
-#define FMT_ATC_PATH         "/arm-io/atc-phy%u"
-#define FMT_DRD_PATH         "/arm-io/usb-drd%u"
+#define FMT_DART_PATH           "/arm-io/dart-usb%u"
+#define FMT_DART_MAPPER_PATH    "/arm-io/dart-usb%u/mapper-usb%u"
+#define FMT_ATC_PATH            "/arm-io/atc-phy%u"
+#define FMT_DRD_PATH            "/arm-io/usb-drd%u"
+#define SINGLE_DART_PATH        "/arm-io/dart-usb"
+#define SINGLE_DART_MAPPER_PATH "/arm-io/dart-usb/mapper-usb-drd"
+#define SINGLE_ATC_PATH         "/arm-io/atc-phy"
+#define SINGLE_DRD_PATH         "/arm-io/usb-drd"
 // HPM_PATH string is at most
 // "/arm-io/i2cX" (12) + "/" + hpmBusManagerX (14) + "/" + "hpmX" (4) + '\0'
 #define MAX_HPM_PATH_LEN 40
@@ -48,6 +53,55 @@ struct usb_drd_regs {
 static tps6598x_irq_state_t tps6598x_irq_state[USB_IODEV_COUNT];
 static bool usb_is_initialized = false;
 usb_type_t usb_type = USB_TYPE_DWC3;
+
+#define AUSB_CTL                  0x00
+#define AUSB_CTL_RESET            BIT(0)
+#define AUSB_CTL_PWRDOWN          BIT(2)
+#define AUSB_CTL_SIDDQ            BIT(3)
+#define AUSB_SIG                  0x04
+#define AUSB_SIG_VBUSDET_FORCE_EN BIT(1)
+
+static bool usb_uses_single_drd_paths(u32 idx)
+{
+    if (idx != 0)
+        return false;
+
+    return adt_path_offset(adt, SINGLE_DART_PATH) >= 0 &&
+           adt_path_offset(adt, SINGLE_DART_MAPPER_PATH) >= 0 &&
+           adt_path_offset(adt, SINGLE_ATC_PATH) >= 0 && adt_path_offset(adt, SINGLE_DRD_PATH) >= 0;
+}
+
+static void usb_get_dart_path(char *path, size_t size, u32 idx)
+{
+    if (usb_uses_single_drd_paths(idx))
+        snprintf(path, size, "%s", SINGLE_DART_PATH);
+    else
+        snprintf(path, size, FMT_DART_PATH, idx);
+}
+
+static void usb_get_dart_mapper_path(char *path, size_t size, u32 idx)
+{
+    if (usb_uses_single_drd_paths(idx))
+        snprintf(path, size, "%s", SINGLE_DART_MAPPER_PATH);
+    else
+        snprintf(path, size, FMT_DART_MAPPER_PATH, idx, idx);
+}
+
+static void usb_get_atc_path(char *path, size_t size, u32 idx)
+{
+    if (usb_uses_single_drd_paths(idx))
+        snprintf(path, size, "%s", SINGLE_ATC_PATH);
+    else
+        snprintf(path, size, FMT_ATC_PATH, idx);
+}
+
+static void usb_get_drd_path(char *path, size_t size, u32 idx)
+{
+    if (usb_uses_single_drd_paths(idx))
+        snprintf(path, size, "%s", SINGLE_DRD_PATH);
+    else
+        snprintf(path, size, FMT_DRD_PATH, idx);
+}
 
 #define PIPEHANDLER_MUX_CTRL             0x0c
 #define PIPEHANDLER_MUX_CTRL_USB3        0x08
@@ -72,7 +126,7 @@ static dart_dev_t *usb_dart_init(u32 idx)
     int mapper_offset;
     char path[sizeof(FMT_DART_MAPPER_PATH)];
 
-    snprintf(path, sizeof(path), FMT_DART_MAPPER_PATH, idx, idx);
+    usb_get_dart_mapper_path(path, sizeof(path), idx);
     mapper_offset = adt_path_offset(adt, path);
     if (mapper_offset < 0) {
         // Device not present
@@ -85,7 +139,7 @@ static dart_dev_t *usb_dart_init(u32 idx)
         return NULL;
     }
 
-    snprintf(path, sizeof(path), FMT_DART_PATH, idx);
+    usb_get_dart_path(path, sizeof(path), idx);
     return dart_init_adt(path, 1, dart_idx, false);
 }
 
@@ -98,31 +152,34 @@ static int usb_drd_get_regs(u32 idx, struct usb_drd_regs *regs)
     char phy_path[sizeof(FMT_ATC_PATH)];
     char drd_path[sizeof(FMT_DRD_PATH)];
 
-    snprintf(drd_path, sizeof(drd_path), FMT_DRD_PATH, idx);
+    usb_get_drd_path(drd_path, sizeof(drd_path), idx);
     adt_drd_offset = adt_path_offset_trace(adt, drd_path, adt_drd_path);
     if (adt_drd_offset < 0) {
         // Nonexistent device
         return -1;
     }
 
-    snprintf(phy_path, sizeof(phy_path), FMT_ATC_PATH, idx);
+    usb_get_atc_path(phy_path, sizeof(phy_path), idx);
     adt_phy_offset = adt_path_offset_trace(adt, phy_path, adt_phy_path);
     if (adt_phy_offset < 0) {
         printf("usb: Error getting phy node %s\n", phy_path);
         return -1;
     }
 
-    if (adt_get_reg(adt, adt_phy_path, "reg", 0, &regs->atc, NULL) < 0) {
-        printf("usb: Error getting reg with index 0 for %s.\n", phy_path);
+    int phy_reg = usb_uses_single_drd_paths(idx) ? 1 : 0;
+    if (adt_get_reg(adt, adt_phy_path, "reg", phy_reg, &regs->atc, NULL) < 0) {
+        printf("usb: Error getting reg with index %d for %s.\n", phy_reg, phy_path);
         return -1;
     }
     if (adt_get_reg(adt, adt_drd_path, "reg", 0, &regs->drd_regs, NULL) < 0) {
         printf("usb: Error getting reg with index 0 for %s.\n", drd_path);
         return -1;
     }
-    if (adt_get_reg(adt, adt_drd_path, "reg", 3, &regs->drd_regs_unk3, NULL) < 0) {
-        printf("usb: Error getting reg with index 3 for %s.\n", drd_path);
-        return -1;
+    if (!usb_uses_single_drd_paths(idx)) {
+        if (adt_get_reg(adt, adt_drd_path, "reg", 3, &regs->drd_regs_unk3, NULL) < 0) {
+            printf("usb: Error getting reg with index 3 for %s.\n", drd_path);
+            return -1;
+        }
     }
 
     return 0;
@@ -139,33 +196,53 @@ int usb_phy_bringup(u32 idx)
     if (usb_drd_get_regs(idx, &usb_regs) < 0)
         return -1;
 
-    snprintf(path, sizeof(path), FMT_ATC_PATH, idx);
+    usb_get_atc_path(path, sizeof(path), idx);
     if (pmgr_adt_power_enable(path) < 0)
         return -1;
 
-    snprintf(path, sizeof(path), FMT_DART_PATH, idx);
+    usb_get_dart_path(path, sizeof(path), idx);
     if (pmgr_adt_power_enable(path) < 0)
         return -1;
 
-    snprintf(path, sizeof(path), FMT_DRD_PATH, idx);
+    usb_get_drd_path(path, sizeof(path), idx);
     if (pmgr_adt_power_enable(path) < 0)
         return -1;
 
-    write32(usb_regs.atc + 0x08, 0x01c1000f);
-    write32(usb_regs.atc + 0x04, 0x00000003);
-    write32(usb_regs.atc + 0x04, 0x00000000);
-    write32(usb_regs.atc + 0x1c, 0x008c0813);
-    write32(usb_regs.atc + 0x00, 0x00000002);
+    if (usb_uses_single_drd_paths(idx)) {
+        /* T8030 phones use the standalone AUSB USB2 PHY, not an ATC PHY/pipehandler. */
+        if (tunables_apply_global(SINGLE_ATC_PATH, "tunable-device") < 0)
+            return -1;
 
-    write32(usb_regs.drd_regs_unk3 + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_DUMMY);
-    write32(usb_regs.drd_regs_unk3 + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
-    write32(usb_regs.drd_regs_unk3 + PIPEHANDLER_NONSELECTED_OVERRIDE, 0x9332);
+        set32(usb_regs.atc + AUSB_CTL, AUSB_CTL_RESET);
+        udelay(20);
+        clear32(usb_regs.atc + AUSB_CTL, AUSB_CTL_PWRDOWN | AUSB_CTL_SIDDQ);
+        udelay(20);
+        clear32(usb_regs.atc + AUSB_CTL, AUSB_CTL_RESET);
+        udelay(1500);
+        set32(usb_regs.atc + AUSB_SIG, AUSB_SIG_VBUSDET_FORCE_EN);
+
+        if (tunables_apply_global(SINGLE_DRD_PATH, "tunable") < 0)
+            return -1;
+    } else {
+        write32(usb_regs.atc + 0x08, 0x01c1000f);
+        write32(usb_regs.atc + 0x04, 0x00000003);
+        write32(usb_regs.atc + 0x04, 0x00000000);
+        write32(usb_regs.atc + 0x1c, 0x008c0813);
+        write32(usb_regs.atc + 0x00, 0x00000002);
+
+        write32(usb_regs.drd_regs_unk3 + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_DUMMY);
+        write32(usb_regs.drd_regs_unk3 + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+        write32(usb_regs.drd_regs_unk3 + PIPEHANDLER_NONSELECTED_OVERRIDE, 0x9332);
+    }
 
     return 0;
 }
 
 dwc3_dev_t *usb_iodev_bringup(u32 idx)
 {
+    if (usb_uses_single_drd_paths(idx))
+        printf("usb: using single-port DRD layout for USB%d\n", idx);
+
     dart_dev_t *usb_dart = usb_dart_init(idx);
     if (!usb_dart)
         return NULL;
@@ -627,6 +704,8 @@ void usb_iodev_init(void)
         adt_path_offset(adt, "/arm-io/usb-complex") > 0) {
         return; // already init in usb_init() since we do have only 1 usb port
     }
+    int initialized = 0;
+
     for (int i = FIRST_USB_IODEV; i < USB_IODEV_COUNT; i++) {
         dwc3_dev_t *opaque;
         struct iodev *usb_iodev;
@@ -646,7 +725,11 @@ void usb_iodev_init(void)
 
         iodev_register_device(IODEV_USB0 + i, usb_iodev);
         printf("USB%d: initialized at %p\n", i, opaque);
+        initialized++;
     }
+
+    if (!initialized)
+        printf("usb: no USB I/O devices initialized\n");
 }
 
 void usb_iodev_shutdown(void)

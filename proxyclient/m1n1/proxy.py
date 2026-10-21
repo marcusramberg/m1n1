@@ -205,6 +205,11 @@ class UartInterface(Reloadable):
         payload = payload.ljust(self.CMD_LEN, b"\x00")
         command = struct.pack("<I", cmd) + payload
         command += struct.pack("<I", self.checksum(command))
+        out_transfer_size = getattr(self.dev, "out_transfer_size", 0)
+        if out_transfer_size:
+            if len(command) > out_transfer_size:
+                raise ValueError("Command is larger than the USB OUT transfer")
+            command = command.ljust(out_transfer_size, b"\x00")
         if self.debug:
             print("<<", hexdump(command))
         self.dev.write(command)
@@ -300,6 +305,11 @@ class UartInterface(Reloadable):
                     self.handle_boot(data)
                     reply = b''
                     continue
+                if getattr(self.dev, "raw_usb", False):
+                    # Full-TRB mode can expose replies queued by earlier probes.
+                    # Ignore stale complete frames until the requested type arrives.
+                    reply = b''
+                    continue
                 raise UartCMDError("Reply command mismatch: Expected 0x%08x, got 0x%08x"%(cmd, cmdin))
             if status != self.ST_OK:
                 if status == self.ST_BADCMD:
@@ -361,6 +371,9 @@ class UartInterface(Reloadable):
     def nop(self):
         features = Feature.get_all()
 
+        if getattr(self.dev, "out_transfer_size", 0):
+            features = Feature(0)
+
         # Send the supported feature flags in the NOP message (has no effect
         # if the target does not support it)
         self.cmd(self.REQ_NOP, struct.pack("<Q", features.value))
@@ -390,15 +403,39 @@ class UartInterface(Reloadable):
         checksum = self.data_checksum(data)
         size = len(data)
         req = struct.pack("<QQI", addr, size, checksum)
-        self.cmd(self.REQ_MEMWRITE, req)
+        out_transfer_size = getattr(self.dev, "out_transfer_size", 0)
+        if out_transfer_size:
+            payload = req.ljust(self.CMD_LEN, b"\x00")
+            pending = struct.pack("<I", self.REQ_MEMWRITE) + payload
+            pending += struct.pack("<I", self.checksum(pending))
+        else:
+            self.cmd(self.REQ_MEMWRITE, req)
         if self.debug:
             print("<< DATA:")
             chexdump(data)
-        for i in range(0, len(data), 8192):
-            self.dev.write(data[i:i + 8192])
-            if progress:
-                sys.stdout.write(".")
-                sys.stdout.flush()
+        if out_transfer_size:
+            offset = 0
+            while offset < len(data):
+                take = min(out_transfer_size - len(pending), len(data) - offset)
+                pending += data[offset:offset + take]
+                offset += take
+                if len(pending) == out_transfer_size:
+                    self.dev.write(pending)
+                    pending = b""
+                    if progress:
+                        sys.stdout.write(".")
+                        sys.stdout.flush()
+            if pending:
+                self.dev.write(pending.ljust(out_transfer_size, b"\x00"))
+                if progress:
+                    sys.stdout.write(".")
+                    sys.stdout.flush()
+        else:
+            for i in range(0, len(data), 8192):
+                self.dev.write(data[i:i + 8192])
+                if progress:
+                    sys.stdout.write(".")
+                    sys.stdout.flush()
         if progress:
             print()
         if self.enabled_features & Feature.DISABLE_DATA_CSUMS:
@@ -672,13 +709,17 @@ class M1N1Proxy(Reloadable):
         if no_reply or reboot and reply is None:
             return
         ret_fmt = "q" if signed else "Q"
-        rop, status, retval = struct.unpack("<Qq" + ret_fmt, reply)
-        if self.debug:
-            print(">>>> %08x: %d %08x"%(rop, status, retval))
-        if reboot:
-            return
-        if rop != opcode:
-            raise ProxyReplyError("Reply opcode mismatch: Expected 0x%08x, got 0x%08x"%(opcode,rop))
+        while True:
+            rop, status, retval = struct.unpack("<Qq" + ret_fmt, reply)
+            if self.debug:
+                print(">>>> %08x: %d %08x"%(rop, status, retval))
+            if reboot:
+                return
+            if rop == opcode:
+                break
+            if not getattr(self.iface.dev, "raw_usb", False):
+                raise ProxyReplyError("Reply opcode mismatch: Expected 0x%08x, got 0x%08x"%(opcode,rop))
+            reply = self.iface.reply(self.iface.REQ_PROXY)
         if status != self.S_OK:
             if status == self.S_BADCMD:
                 raise ProxyCommandError("Reply error: Bad Command")

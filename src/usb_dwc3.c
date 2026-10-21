@@ -135,6 +135,8 @@ typedef struct dwc3_dev {
 
 } dwc3_dev_t;
 
+static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 endpoint_number);
+
 static const struct usb_string_descriptor str_manufacturer =
     make_usb_string_descriptor("Asahi Linux");
 static const struct usb_string_descriptor str_product =
@@ -397,7 +399,11 @@ static int usb_dwc3_ep_command(dwc3_dev_t *dev, u8 ep, u32 command, u32 par0, u3
     write32(dev->regs + DWC3_DEPCMD(ep), command | DWC3_DEPCMD_CMDACT);
 
     if (poll32(dev->regs + DWC3_DEPCMD(ep), DWC3_DEPCMD_CMDACT, 0, 1000)) {
-        usb_debug_printf("timeout while waiting for DWC3_DEPCMD_CMDACT to clear.\n");
+        usb_debug_printf("EP%d command 0x%x timed out: DEPCMD=%08x DCTL=%08x DSTS=%08x "
+                         "GCTL=%08x GSNPSID=%08x.\n",
+                         ep, command, read32(dev->regs + DWC3_DEPCMD(ep)),
+                         read32(dev->regs + DWC3_DCTL), read32(dev->regs + DWC3_DSTS),
+                         read32(dev->regs + DWC3_GCTL), read32(dev->regs + DWC3_GSNPSID));
         return -1;
     }
 
@@ -777,6 +783,12 @@ static void usb_dwc3_ep0_handle_class(dwc3_dev_t *dev, const union usb_setup_pac
                 dev->pipe[pipe].ready = false;
                 usb_debug_printf("ACM device opened\n");
                 dev->pipe[pipe].ready = true;
+                /*
+                 * Some DWC3 revisions do not generate XFERNOTREADY for bulk OUT
+                 * until a transfer is queued. Prime RX when the host opens the
+                 * CDC port instead of relying exclusively on that event.
+                 */
+                usb_dwc3_cdc_start_bulk_out_xfer(dev, dev->pipe[pipe].ep_out);
             } else {
                 dev->pipe[pipe].ready = false;
                 usb_debug_printf("ACM device closed\n");
@@ -1105,6 +1117,9 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
         debug_printf("no DWC3 core found at 0x%lx: %08x\n", regs, snpsid);
         return NULL;
     }
+
+    printf("usb-dwc3@%lx: core ID %08x DCTL=%08x DSTS=%08x GCTL=%08x\n", regs, snpsid,
+           read32(regs + DWC3_DCTL), read32(regs + DWC3_DSTS), read32(regs + DWC3_GCTL));
 
     dwc3_dev_t *dev = calloc(1, sizeof(*dev));
     if (!dev)

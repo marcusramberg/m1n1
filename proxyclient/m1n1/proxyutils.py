@@ -542,6 +542,18 @@ class GuardedHeap:
 
 def bootstrap_port(iface, proxy):
     to = iface.dev.timeout
+    if getattr(iface.dev, "raw_usb", False):
+        iface.dev.timeout = max(to, 10)
+        # A short write from an earlier CDC probe can remain pending until the
+        # first full-size USB transfer completes.  Its NOP reply is
+        # indistinguishable from our first synchronization NOP and may report
+        # stale feature flags (notably disabled data checksums).  A second NOP
+        # makes the negotiated state and the local view agree.
+        iface.nop()
+        iface.nop()
+        iface.dev.timeout = to
+        return
+
     iface.dev.timeout = 0.15
     try:
         do_baud = proxy.iodev_whoami() == IODEV.UART

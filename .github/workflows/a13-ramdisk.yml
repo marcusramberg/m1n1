@@ -1,0 +1,93 @@
+name: Inspect D431 Apple ramdisk
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    # Standard public runners have free minutes; artifact storage still has quotas.
+    if: ${{ !github.event.repository.private }}
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      OUT: ${{ github.workspace }}/build/a13-ramdisk
+      OTA_URL: https://updates.cdn-apple.com/2026WinterFCS/patches/122-58491/9412B08D-D828-426C-BDCF-7FD42E2C83FC/com_apple_MobileAsset_SoftwareUpdate/89e2763cfd94578fea6621ec54ad0167d9a9f8bb.zip
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Check inspection helper
+        run: python3 tools/test_a13_ramdisk.py
+
+      - name: Install pinned native ipsw
+        run: |
+          mkdir -p "$OUT" "$RUNNER_TEMP/ipsw-tools"
+          printf '%s\n' 'STOCK UPDATE RAMDISK: NOT AN SSH IMAGE OR VALIDATED BOOTCHAIN. DO NOT BOOT.' > "$OUT/NOT-BOOTABLE.txt"
+          curl --fail --location --proto '=https' --proto-redir '=https' --retry 3 --max-time 300 \
+            https://github.com/blacktop/ipsw/releases/download/v3.1.737/ipsw_3.1.737_macOS_universal.tar.gz \
+            -o "$RUNNER_TEMP/ipsw.tar.gz"
+          printf '%s  %s\n' a871dfbd55fef19dd433bb46964460c97fa9eeb4ee7ec8c5c29934209dc79c6e "$RUNNER_TEMP/ipsw.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/ipsw.tar.gz" -C "$RUNNER_TEMP/ipsw-tools" ipsw
+          echo "$RUNNER_TEMP/ipsw-tools" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/ipsw-tools/ipsw" version > "$OUT/ipsw-version.txt"
+
+      - name: Fetch matching stock inputs only
+        run: |
+          # Range extraction: do not download the entire 6.7 GB OTA.
+          ipsw extract --remote \
+            --pattern '^AssetData/(boot/BuildManifest\.plist|payload/replace/usr/standalone/update/ramdisk/arm64eSURamDisk\.dmg)$' \
+            --output "$OUT/inputs" "$OTA_URL"
+          raw=$(python3 tools/a13_ramdisk.py check "$OUT/inputs")
+          if ! ipsw img4 im4p extract -o "$OUT/ramdisk.dmg" "$raw" > "$OUT/unwrap.log" 2>&1; then
+            # OTA may already contain an unwrapped disk image. Mount must still validate it.
+            cp "$raw" "$OUT/ramdisk.dmg"
+          fi
+          file "$raw" "$OUT/ramdisk.dmg" > "$OUT/image-types.txt"
+
+      - name: Inspect runner-local image read-only
+        run: |
+          mountpoint=$(mktemp -d "$RUNNER_TEMP/d431-mount.XXXXXX")
+          trap 'hdiutil detach "$mountpoint" || true; rmdir "$mountpoint" || true' EXIT
+          # Prefer native DMG detection; flat APFS images need an explicit image class.
+          image_options=()
+          if ! hdiutil imageinfo "$OUT/ramdisk.dmg" > "$OUT/image-info.txt" 2>&1; then
+            image_options=(-imagekey diskimage-class=CRawDiskImage)
+          fi
+          # This is a local file on an ephemeral runner, never a phone or host disk node.
+          hdiutil attach -readonly -nobrowse -owners off "${image_options[@]}" \
+            -mountpoint "$mountpoint" -plist "$OUT/ramdisk.dmg" > "$OUT/attach.plist" < /dev/null
+          python3 tools/a13_ramdisk.py inspect "$mountpoint" "$OUT/inspection"
+          hdiutil detach "$mountpoint"
+          rmdir "$mountpoint"
+          trap - EXIT
+
+      - name: Record artifact checksums and status
+        if: ${{ always() }}
+        run: |
+          if [[ -d "$OUT" ]]; then
+            checksums=$(mktemp "$RUNNER_TEMP/d431-sha256.XXXXXX")
+            (cd "$OUT"; find . -type f ! -name SHA256SUMS -exec shasum -a 256 {} +) > "$checksums"
+            mv "$checksums" "$OUT/SHA256SUMS"
+          fi
+          printf '%s\n' \
+            '## D431 / iOS 18.7.8 (22H352) inspection' \
+            'Stock Apple inputs and read-only inspection output only; artifacts may be partial on failure.' \
+            '**Not an SSH image or validated bootchain. Do not boot or restore these files.**' \
+            'No phone access, kernel patches, upstream helpers, SEP commands, or NVRAM changes.' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: ${{ always() }}
+        with:
+          name: d431-18.7.8-22H352-inspection-${{ github.run_number }}
+          path: build/a13-ramdisk/
+          retention-days: 1
+          if-no-files-found: error
