@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import plistlib
 import tempfile
+from unittest.mock import patch
 
 import a13_ramdisk
 
@@ -73,6 +74,49 @@ def test_a13_ramdisk():
             pass
         else:
             raise AssertionError("Inspection output inside source accepted")
+
+        version = image / "System/Library/CoreServices/SystemVersion.plist"
+        version.parent.mkdir(parents=True)
+        version.write_bytes(plistlib.dumps({"ProductName": "iPhone OS",
+                                           "ProductVersion": "18.7.8",
+                                           "ProductBuildVersion": "22H352"}))
+        ramrod = daemons / "com.apple.ramrod.plist"
+        ramrod.write_bytes(b"stock launch job fixture")
+        digest = hashlib.sha256(ramrod.read_bytes()).hexdigest()
+        probe = root / "probe"
+        macho = bytes.fromhex("cffaedfe0c000001") + bytes(24)
+        disabled = daemons.with_name("LaunchDaemons.stock-disabled")
+        with patch.object(a13_ramdisk, "RAMROD_SHA256", digest):
+            for uid, mounted, payload in ((1000, True, macho), (0, False, macho),
+                                          (0, True, b"not a Mach-O")):
+                probe.write_bytes(payload)
+                with patch.object(a13_ramdisk.os, "geteuid", return_value=uid), \
+                     patch.object(Path, "is_mount", return_value=mounted):
+                    try:
+                        a13_ramdisk.prepare_image(image, probe)
+                    except ValueError:
+                        pass
+                    else:
+                        raise AssertionError("Unsafe preparation accepted")
+                assert ramrod.exists() and not disabled.exists()
+            probe.write_bytes(macho)
+            with patch.object(a13_ramdisk.os, "geteuid", return_value=0), \
+                 patch.object(Path, "is_mount", return_value=True), \
+                 patch.object(a13_ramdisk.os, "chown") as chown:
+                a13_ramdisk.prepare_image(image, probe)
+                assert chown.call_count == 4
+            a13_ramdisk.verify_image(image, probe)
+            assert (disabled / ramrod.name).read_bytes() == b"stock launch job fixture"
+            (daemons / "unexpected.plist").write_bytes(b"unexpected active job")
+            try:
+                a13_ramdisk.verify_image(image, probe)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Extra launch job accepted")
+        entitlements = plistlib.loads(Path(__file__).with_name("a13_uart_probe.entitlements").read_bytes())
+        assert entitlements == {"platform-application": True,
+                                "com.apple.private.security.no-container": True}
 
 
 if __name__ == "__main__":

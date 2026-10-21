@@ -1,4 +1,4 @@
-name: Inspect D431 Apple ramdisk
+name: Prepare D431 UART probe
 
 on:
   workflow_dispatch:
@@ -17,6 +17,7 @@ jobs:
         shell: bash
     env:
       OUT: ${{ github.workspace }}/build/a13-ramdisk
+      STOCK_IMAGE_SHA256: 14d41415663d4964e57ad17444806ae9019068b373afcebcc8699b76c2d11eb2
       OTA_URL: https://updates.cdn-apple.com/2026WinterFCS/patches/122-58491/9412B08D-D828-426C-BDCF-7FD42E2C83FC/com_apple_MobileAsset_SoftwareUpdate/89e2763cfd94578fea6621ec54ad0167d9a9f8bb.zip
 
     steps:
@@ -24,13 +25,16 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check inspection helper
-        run: python3 tools/test_a13_ramdisk.py
+      - name: Check image helper and non-mutating probe
+        run: |
+          python3 tools/test_a13_ramdisk.py
+          cc -std=c11 -Wall -Wextra -Werror tools/test_a13_uart_probe.c -o "$RUNNER_TEMP/test-a13-uart-probe"
+          "$RUNNER_TEMP/test-a13-uart-probe"
 
       - name: Install pinned native ipsw
         run: |
           mkdir -p "$OUT" "$RUNNER_TEMP/ipsw-tools"
-          printf '%s\n' 'STOCK UPDATE RAMDISK: NOT AN SSH IMAGE OR VALIDATED BOOTCHAIN. DO NOT BOOT.' > "$OUT/NOT-BOOTABLE.txt"
+          printf '%s\n' 'UNBOOTED UART CANDIDATE. D431 BOOTCHAIN/TRUSTCACHE NOT VALIDATED. DO NOT BOOT OR RESTORE.' > "$OUT/NOT-BOOTABLE.txt"
           curl --fail --location --proto '=https' --proto-redir '=https' --retry 3 --max-time 300 \
             https://github.com/blacktop/ipsw/releases/download/v3.1.737/ipsw_3.1.737_macOS_universal.tar.gz \
             -o "$RUNNER_TEMP/ipsw.tar.gz"
@@ -51,6 +55,7 @@ jobs:
             cp "$raw" "$OUT/ramdisk.dmg"
           fi
           file "$raw" "$OUT/ramdisk.dmg" > "$OUT/image-types.txt"
+          printf '%s  %s\n' "$STOCK_IMAGE_SHA256" "$OUT/ramdisk.dmg" | shasum -a 256 -c -
 
       - name: Inspect runner-local image read-only
         run: |
@@ -69,6 +74,35 @@ jobs:
           rmdir "$mountpoint"
           trap - EXIT
 
+      - name: Compile and ad-hoc sign fixed UART probe
+        run: |
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=18.0 \
+            -std=c11 -Os -Wall -Wextra -Werror tools/a13_uart_probe.c -o "$OUT/a13-uart-probe"
+          codesign --force --sign - --timestamp=none \
+            --entitlements tools/a13_uart_probe.entitlements "$OUT/a13-uart-probe"
+          codesign --verify --strict "$OUT/a13-uart-probe"
+          xcrun lipo -verify_arch arm64 "$OUT/a13-uart-probe"
+          codesign -d --verbose=4 "$OUT/a13-uart-probe" 2> "$OUT/probe-signature.txt"
+          cp tools/a13_uart_probe.c tools/a13_uart_probe.entitlements "$OUT/"
+
+      - name: Prepare separate runner-local UART image
+        run: |
+          candidate="$RUNNER_TEMP/uart-probe-working.dmg"
+          cp "$OUT/ramdisk.dmg" "$candidate"
+          mountpoint=$(mktemp -d "$RUNNER_TEMP/d431-probe.XXXXXX")
+          trap 'hdiutil detach "$mountpoint" || true; rmdir "$mountpoint" || true' EXIT
+          hdiutil attach -nobrowse -owners on -imagekey diskimage-class=CRawDiskImage \
+            -mountpoint "$mountpoint" "$candidate" < /dev/null
+          sudo "$(command -v python3)" tools/a13_ramdisk.py prepare "$mountpoint" "$OUT/a13-uart-probe" | tee "$OUT/uart-policy.txt"
+          sudo "$(command -v python3)" tools/a13_ramdisk.py verify "$mountpoint" "$OUT/a13-uart-probe" | tee -a "$OUT/uart-policy.txt"
+          sudo "$(command -v python3)" tools/a13_ramdisk.py inspect "$mountpoint" "$OUT/uart-inspection"
+          hdiutil detach "$mountpoint"
+          rmdir "$mountpoint"
+          trap - EXIT
+          printf '%s  %s\n' "$STOCK_IMAGE_SHA256" "$OUT/ramdisk.dmg" | shasum -a 256 -c -
+          # Publish no partially modified image if preparation or detach failed.
+          mv "$candidate" "$OUT/uart-probe.dmg"
+
       - name: Record artifact checksums and status
         if: ${{ always() }}
         run: |
@@ -78,16 +112,17 @@ jobs:
             mv "$checksums" "$OUT/SHA256SUMS"
           fi
           printf '%s\n' \
-            '## D431 / iOS 18.7.8 (22H352) inspection' \
-            'Stock Apple inputs and read-only inspection output only; artifacts may be partial on failure.' \
-            '**Not an SSH image or validated bootchain. Do not boot or restore these files.**' \
+            '## D431 / iOS 18.7.8 (22H352) UART candidate' \
+            'Separate probe image disables stock launch jobs; stock image remains unchanged. Outputs may be partial on failure.' \
+            '**Unbooted: D431 boot patches and trustcache integration still require validation. Do not boot or restore yet.**' \
+            'Fixed probe reports kernel/mounts and resolves APFS symbols without calling them.' \
             'No phone access, kernel patches, upstream helpers, SEP commands, or NVRAM changes.' \
             >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: ${{ always() }}
         with:
-          name: d431-18.7.8-22H352-inspection-${{ github.run_number }}
+          name: d431-18.7.8-22H352-uart-probe-${{ github.run_number }}
           path: build/a13-ramdisk/
           retention-days: 1
           if-no-files-found: error
