@@ -81,7 +81,7 @@ jobs:
           codesign --force --sign - --timestamp=none \
             --entitlements tools/a13_uart_probe.entitlements "$OUT/a13-uart-probe"
           codesign --verify --strict "$OUT/a13-uart-probe"
-          xcrun lipo -verify_arch arm64 "$OUT/a13-uart-probe"
+          xcrun lipo "$OUT/a13-uart-probe" -verify_arch arm64
           codesign -d --verbose=4 "$OUT/a13-uart-probe" 2> "$OUT/probe-signature.txt"
           cp tools/a13_uart_probe.c tools/a13_uart_probe.entitlements "$OUT/"
 
