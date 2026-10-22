@@ -47,7 +47,7 @@ jobs:
         run: |
           # Range extraction: do not download the entire 6.7 GB OTA.
           ipsw extract --remote \
-            --pattern '^AssetData/(boot/BuildManifest\.plist|payload/replace/usr/standalone/update/ramdisk/arm64eSURamDisk\.dmg)$' \
+            --pattern '^AssetData/(boot/BuildManifest\.plist|boot/kernelcache\.release\.iphone12|payload/replace/usr/standalone/update/ramdisk/arm64eSURamDisk\.dmg)$' \
             --output "$OUT/inputs" "$OTA_URL"
           raw=$(python3 tools/a13_ramdisk.py check "$OUT/inputs")
           if ! ipsw img4 im4p extract -o "$OUT/ramdisk.dmg" "$raw" > "$OUT/unwrap.log" 2>&1; then
@@ -56,6 +56,39 @@ jobs:
           fi
           file "$raw" "$OUT/ramdisk.dmg" > "$OUT/image-types.txt"
           printf '%s  %s\n' "$STOCK_IMAGE_SHA256" "$OUT/ramdisk.dmg" | shasum -a 256 -c -
+
+      - name: Build pinned native IMG4 helper and patch exact D431 kernel
+        env:
+          IM4M_B64: ${{ secrets.D431_T8030_IM4M_B64 }}
+        run: |
+          set -euo pipefail
+          : "${IM4M_B64:?Set repository secret D431_T8030_IM4M_B64 to the base64-encoded T8030 IM4M}"
+          printf '%s' "$IM4M_B64" | base64 -D > "$RUNNER_TEMP/d431-t8030.im4m"
+          printf '%s  %s\n' 0389336c4d7091455d4c8edf52651915f8d8d2e57a5360e04007c51f14c9a35a "$RUNNER_TEMP/d431-t8030.im4m" | shasum -a 256 -c -
+          kernel_im4p=$(find "$OUT/inputs" -name kernelcache.release.iphone12 -type f -print -quit)
+          test -n "$kernel_im4p"
+          printf '%s  %s\n' e860d85a8567c25ceaf90e1740c534375223d4b0929fb8523d9f4cfc01f72b76 "$kernel_im4p" | shasum -a 256 -c -
+          ipsw img4 im4p extract -o "$OUT/kernelcache.stock.raw" "$kernel_im4p"
+          python3 tools/a13_kernel_patch.py \
+            "$OUT/kernelcache.stock.raw" "$OUT/kernelcache.patched.raw" "$OUT/kernelcache.bpatch"
+
+          git clone --no-checkout https://github.com/xerub/img4lib.git "$RUNNER_TEMP/img4lib"
+          git -C "$RUNNER_TEMP/img4lib" fetch --depth=1 origin 69772c72f3c08f021ec9fa4c386f2b3df60a38b7
+          git -C "$RUNNER_TEMP/img4lib" checkout --detach FETCH_HEAD
+          git -C "$RUNNER_TEMP/img4lib" submodule update --init --recursive
+          make -C "$RUNNER_TEMP/img4lib" COMMONCRYPTO=1
+          test -x "$RUNNER_TEMP/img4lib/img4"
+          "$RUNNER_TEMP/img4lib/img4" -h > "$OUT/img4-help.txt"
+
+          "$RUNNER_TEMP/img4lib/img4" \
+            -i "$kernel_im4p" -o "$OUT/KernelCache.img4.native" \
+            -T rkrn -P "$OUT/kernelcache.bpatch" \
+            -M "$RUNNER_TEMP/d431-t8030.im4m" -J
+          python3 -m venv "$RUNNER_TEMP/pyimg4"
+          "$RUNNER_TEMP/pyimg4/bin/pip" install --disable-pip-version-check pyimg4==0.8.8
+          "$RUNNER_TEMP/pyimg4/bin/python" tools/a13_img4_verify.py \
+            "$kernel_im4p" "$OUT/KernelCache.img4.native" \
+            "$OUT/kernelcache.patched.raw" "$RUNNER_TEMP/d431-t8030.im4m"
 
       - name: Inspect runner-local image read-only
         run: |
@@ -114,9 +147,9 @@ jobs:
           printf '%s\n' \
             '## D431 / iOS 18.7.8 (22H352) UART candidate' \
             'Separate probe image disables stock launch jobs; stock image remains unchanged. Outputs may be partial on failure.' \
-            '**Unbooted: D431 boot patches and trustcache integration still require validation. Do not boot or restore yet.**' \
+            '**Unbooted: the native-repacked patched kernel IMG4 is a packaging diagnostic only. D431 boot patches and trustcache integration still require validation. Do not boot or restore from this artifact.**' \
             'Fixed probe reports kernel/mounts and resolves APFS symbols without calling them.' \
-            'No phone access, kernel patches, upstream helpers, SEP commands, or NVRAM changes.' \
+            'No phone access, SEP commands, or NVRAM changes. Kernel patch bytes and native IMG4 wrapping were verified against pinned source hashes.' \
             >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
